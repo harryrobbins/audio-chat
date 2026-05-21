@@ -1,5 +1,6 @@
 import json
 import uuid
+import asyncio
 from google.adk import Runner
 from google.adk.agents import SequentialAgent, LoopAgent
 from google.adk.sessions import InMemorySessionService
@@ -55,9 +56,11 @@ class PodcastFlow:
         docs = result.scalars().all()
         
         yield {"status": "Starting knowledge base build", "total_docs": len(docs)}
+        await asyncio.sleep(0.05)
         
         for i, doc in enumerate(docs):
             yield {"status": f"Analyzing document {i+1}/{len(docs)}: {doc.title}", "doc_id": doc.id}
+            await asyncio.sleep(0.05)
             
             try:
                 facts_data = await self.extract_facts(doc.content)
@@ -74,10 +77,13 @@ class PodcastFlow:
                 
                 await db.commit()
                 yield {"status": f"Extracted {len(facts_data.get('key_facts', []))} facts from {doc.title}"}
+                await asyncio.sleep(0.05)
             except Exception as e:
                 yield {"status": f"Error analyzing {doc.title}: {str(e)}", "error": True}
+                await asyncio.sleep(0.05)
 
         yield {"status": "Knowledge base build complete", "done": True}
+        await asyncio.sleep(0.05)
 
     async def extract_facts(self, text: str) -> dict:
         user_id = "default_user"
@@ -94,12 +100,18 @@ class PodcastFlow:
             parts=[types.Part(text=f"Extract facts from this text:\n\n{text}")]
         )
         
-        events = list(runner.run(user_id=user_id, session_id=session_id, new_message=new_message))
+        events = [event async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=new_message)]
+        if not events:
+            raise Exception(
+                "Fact extractor agent returned no events. This usually indicates an API key or network error. "
+                "Please verify that your GEMINI_API_KEY in the .env file is set to a valid Google Gemini API Key."
+            )
         final_text = self._get_text_from_event(events[-1])
         return self._parse_json(final_text)
 
     async def generate_script_stream(self, project_id: int, prompt: str, db: AsyncSession, max_loops: int = 3) -> AsyncGenerator[dict, None]:
         yield {"status": "Gathering facts from knowledge base..."}
+        await asyncio.sleep(0.05)
         
         # Get all facts for the project
         from sqlalchemy import select
@@ -114,6 +126,7 @@ class PodcastFlow:
         facts_str = json.dumps(facts, indent=2)
         
         yield {"status": "Initializing agent workflow..."}
+        await asyncio.sleep(0.05)
         
         self.refinement_loop.max_iterations = max_loops
         
@@ -144,15 +157,19 @@ class PodcastFlow:
         )
         
         yield {"status": "Agents are collaborating on the script..."}
+        await asyncio.sleep(0.05)
         
         # We run the workflow and listen to events
-        for event in runner.run(user_id=user_id, session_id=session_id, new_message=new_message):
+        async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=new_message):
             if event.author == "persona_generator":
                 yield {"status": "Generated personas", "personas": True}
+                await asyncio.sleep(0.05)
             elif event.author == "script_writer":
                 yield {"status": "Script writer is drafting/refining...", "step": "writing"}
+                await asyncio.sleep(0.05)
             elif event.author == "script_critic":
                 yield {"status": "Script critic is reviewing...", "step": "critique"}
+                await asyncio.sleep(0.05)
 
         # Extract final result
         session = await self.session_service.get_session(
@@ -195,8 +212,10 @@ class PodcastFlow:
             await db.refresh(db_script)
             
             yield {"status": "Script finalized and saved", "script_id": db_script.id, "done": True, "result": final_script, "personas": personas}
+            await asyncio.sleep(0.05)
         else:
             yield {"status": "Failed to generate script", "error": True}
+            await asyncio.sleep(0.05)
 
     async def generate_script(self, facts: dict, max_loops: int = 3) -> dict:
         self.refinement_loop.max_iterations = max_loops
@@ -226,7 +245,7 @@ class PodcastFlow:
         )
         
         # Run the agent workflow
-        events = list(runner.run(user_id=user_id, session_id=session_id, new_message=new_message))
+        events = [event async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=new_message)]
         
         # Extract personas and script from session history
         session = await self.session_service.get_session(
