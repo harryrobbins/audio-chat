@@ -13,7 +13,7 @@
     @apply bg-govuk-black text-govuk-white p-4 border-b-4 border-govuk-blue;
   }
   .govuk-container {
-    @apply max-w-5xl mx-auto p-4;
+    @apply max-w-7xl mx-auto p-4;
   }
   .govuk-button {
     @apply bg-govuk-green text-white px-4 py-2 font-bold shadow-[0_2px_0_0_#002d18] hover:bg-[#005a30] active:translate-y-0.5 active:shadow-none;

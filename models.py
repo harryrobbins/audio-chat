@@ -31,6 +31,7 @@ class Fact(Base):
     id = Column(Integer, primary_key=True, index=True)
     project_id = Column(Integer, ForeignKey("projects.id"))
     document_id = Column(Integer, ForeignKey("documents.id"))
+    document_ids = Column(String, nullable=True) # Comma-separated list of document IDs
     point = Column(Text)
     context = Column(Text)
     created_at = Column(DateTime, default=datetime.datetime.now)
@@ -55,6 +56,8 @@ class Audio(Base):
     id = Column(Integer, primary_key=True, index=True)
     script_id = Column(Integer, ForeignKey("scripts.id"))
     file_path = Column(String)
+    model_name = Column(String, default="kokoro-82m")
+    settings = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.now)
 
     script = relationship("Script", back_populates="audios")

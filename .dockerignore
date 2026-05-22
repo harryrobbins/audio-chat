@@ -1,0 +1,16 @@
+.git
+.gitignore
+.antigravitycli
+.ubuntu-venv
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.idea
+.vscode
+audio_outputs
+audio_chat.db
+frontend/node_modules
+frontend/dist
+.env

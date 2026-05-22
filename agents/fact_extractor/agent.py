@@ -18,7 +18,7 @@ class DocumentSummary(BaseModel):
 # Define the Fact Extractor Agent
 fact_extractor = Agent(
     name="fact_extractor",
-    model=os.environ.get("GEMINI_MODEL", "gemini-1.5-flash"),
+    model=os.environ.get("GEMINI_LITE_MODEL", "gemini-3.1-flash-lite"),
     instruction="""
     You are an expert knowledge extractor. 
     Analyze the USER PROVIDED TEXT below and extract the most important facts and a concise summary.

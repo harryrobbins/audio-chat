@@ -6,6 +6,8 @@ from google.adk.agents import SequentialAgent, LoopAgent
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 from .fact_extractor.agent import fact_extractor
+from .fact_reconciler.agent import fact_reconciler
+from .fact_curator.agent import fact_curator
 from .persona_generator.agent import persona_generator
 from .script_writer.agent import script_writer
 from .script_critic.agent import script_critic
@@ -20,6 +22,8 @@ class PodcastFlow:
         
         # Define agents
         self.fact_extractor = fact_extractor
+        self.fact_reconciler = fact_reconciler
+        self.fact_curator = fact_curator
         self.persona_generator = persona_generator
         self.script_writer = script_writer
         self.script_critic = script_critic
@@ -49,39 +53,219 @@ class PodcastFlow:
             session_service=self.session_service
         )
 
+    async def reconcile_facts_agent(self, existing_facts: list, new_facts: list) -> dict:
+        user_id = "default_user"
+        session_id = str(uuid.uuid4())
+        await self.session_service.create_session(
+            app_name=self.app_name,
+            user_id=user_id,
+            session_id=session_id
+        )
+        
+        runner = await self._get_runner(self.fact_reconciler)
+        
+        # Format existing and new facts in a readable JSON block
+        prompt_content = f"""
+        EXISTING compiled facts:
+        {json.dumps(existing_facts, indent=2)}
+        
+        NEW candidate facts to merge:
+        {json.dumps(new_facts, indent=2)}
+        """
+        
+        new_message = types.Content(
+            role="user",
+            parts=[types.Part(text=prompt_content)]
+        )
+        
+        events = [event async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=new_message)]
+        if not events:
+            raise Exception("Fact reconciler agent returned no events.")
+        final_text = self._get_text_from_event(events[-1])
+        return self._parse_json(final_text)
+
+    async def curate_facts_agent(self, compiled_facts: list) -> dict:
+        user_id = "default_user"
+        session_id = str(uuid.uuid4())
+        await self.session_service.create_session(
+            app_name=self.app_name,
+            user_id=user_id,
+            session_id=session_id
+        )
+        
+        runner = await self._get_runner(self.fact_curator)
+        
+        prompt_content = f"""
+        COMPILED facts to curate:
+        {json.dumps(compiled_facts, indent=2)}
+        """
+        
+        new_message = types.Content(
+            role="user",
+            parts=[types.Part(text=prompt_content)]
+        )
+        
+        events = [event async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=new_message)]
+        if not events:
+            raise Exception("Fact curator agent returned no events.")
+        final_text = self._get_text_from_event(events[-1])
+        return self._parse_json(final_text)
+
     async def build_knowledge_base(self, project_id: int, db: AsyncSession) -> AsyncGenerator[dict, None]:
-        # Get all documents for the project
-        from sqlalchemy import select
+        # 1. Get all documents for the project
+        from sqlalchemy import select, delete
         result = await db.execute(select(models.Document).where(models.Document.project_id == project_id))
         docs = result.scalars().all()
         
-        yield {"status": "Starting knowledge base build", "total_docs": len(docs)}
+        if not docs:
+            yield {"status": "No source documents found. Add documents first.", "done": True}
+            await asyncio.sleep(0.05)
+            return
+
+        # Clear existing facts to compile fresh
+        yield {"status": "Clearing existing knowledge base facts...", "total_docs": len(docs)}
+        await asyncio.sleep(0.05)
+        await db.execute(delete(models.Fact).where(models.Fact.project_id == project_id))
+        await db.commit()
+
+        # 2. Extract facts in PARALLEL using GEMINI_LITE_MODEL
+        yield {"status": f"Phase 1: Starting parallel fact extraction on all {len(docs)} documents..."}
         await asyncio.sleep(0.05)
         
-        for i, doc in enumerate(docs):
-            yield {"status": f"Analyzing document {i+1}/{len(docs)}: {doc.title}", "doc_id": doc.id}
+        tasks = []
+        for doc in docs:
+            tasks.append(self.extract_facts(doc.content))
+            
+        try:
+            # Gather all extraction results in parallel
+            extractions = await asyncio.gather(*tasks)
+            yield {"status": f"Phase 1 complete: Extracted raw facts from all {len(docs)} documents."}
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            yield {"status": f"Error during parallel fact extraction: {str(e)}", "error": True}
+            await asyncio.sleep(0.05)
+            return
+
+        # 3. Reconcile facts SEQUENTIALLY using GEMINI_MODEL
+        yield {"status": "Phase 2: Reconciling facts sequentially..."}
+        await asyncio.sleep(0.05)
+        
+        compiled_facts = [] # will store list of dicts: {"point": "...", "context": "...", "document_ids": [doc_id1, ...]}
+        
+        for idx, (doc, facts_data) in enumerate(zip(docs, extractions)):
+            new_candidate_facts = facts_data.get("key_facts", [])
+            yield {"status": f"Integrating {len(new_candidate_facts)} facts from document {idx+1}/{len(docs)}: {doc.title}..."}
             await asyncio.sleep(0.05)
             
-            try:
-                facts_data = await self.extract_facts(doc.content)
+            if not new_candidate_facts:
+                continue
                 
-                # Save facts to DB
-                for fact_item in facts_data.get("key_facts", []):
-                    db_fact = models.Fact(
-                        project_id=project_id,
-                        document_id=doc.id,
-                        point=fact_item["point"],
-                        context=fact_item["context"]
+            if not compiled_facts:
+                # First document: just initialize the compiled facts
+                for fact_item in new_candidate_facts:
+                    compiled_facts.append({
+                        "point": fact_item["point"],
+                        "context": fact_item["context"],
+                        "document_ids": [doc.id]
+                    })
+            else:
+                # Subsequent documents: call reconciler agent
+                try:
+                    # Provide compiled facts with temporary 0-based indices as IDs
+                    existing_facts_with_ids = [
+                        {"id": i, "point": f["point"], "context": f["context"]}
+                        for i, f in enumerate(compiled_facts)
+                    ]
+                    
+                    reconciliation_result = await self.reconcile_facts_agent(
+                        existing_facts=existing_facts_with_ids,
+                        new_facts=new_candidate_facts
                     )
-                    db.add(db_fact)
-                
-                await db.commit()
-                yield {"status": f"Extracted {len(facts_data.get('key_facts', []))} facts from {doc.title}"}
+                    
+                    # Apply reconciliation decisions
+                    reconciled_list = reconciliation_result.get("reconciled_facts", [])
+                    new_compiled_facts = []
+                    
+                    for item in reconciled_list:
+                        ext_id = item.get("existing_fact_id")
+                        if ext_id is not None and 0 <= ext_id < len(compiled_facts):
+                            # Extended fact: update it and add current doc ID to its references
+                            existing_fact = compiled_facts[ext_id]
+                            existing_fact["point"] = item["point"]
+                            existing_fact["context"] = item["context"]
+                            if doc.id not in existing_fact["document_ids"]:
+                                existing_fact["document_ids"].append(doc.id)
+                        else:
+                            # Brand-new fact
+                            new_compiled_facts.append({
+                                "point": item["point"],
+                                "context": item["context"],
+                                "document_ids": [doc.id]
+                            })
+                            
+                    # Append the new facts to the compiled list
+                    compiled_facts.extend(new_compiled_facts)
+                    
+                except Exception as e:
+                    yield {"status": f"Warning: Reconciler error on {doc.title}: {str(e)}. Appending facts directly.", "warning": True}
+                    await asyncio.sleep(0.05)
+                    # Fallback: append them directly
+                    for fact_item in new_candidate_facts:
+                        compiled_facts.append({
+                            "point": fact_item["point"],
+                            "context": fact_item["context"],
+                            "document_ids": [doc.id]
+                        })
+
+        # 4. Perform final global curation using GEMINI_MODEL
+        yield {"status": "Phase 3: Performing final knowledge base curation and synthesis..."}
+        await asyncio.sleep(0.05)
+        
+        final_facts = []
+        if compiled_facts:
+            try:
+                curation_result = await self.curate_facts_agent(compiled_facts)
+                curated_list = curation_result.get("curated_facts", [])
+                for cf in curated_list:
+                    final_facts.append({
+                        "point": cf["point"],
+                        "context": cf["context"],
+                        "document_ids": cf.get("document_ids", [])
+                    })
+                yield {"status": f"Curation complete. Unified facts from {len(compiled_facts)} down to {len(final_facts)} premium entries."}
                 await asyncio.sleep(0.05)
             except Exception as e:
-                yield {"status": f"Error analyzing {doc.title}: {str(e)}", "error": True}
+                yield {"status": f"Warning: Curator error: {str(e)}. Using compiled facts as-is.", "warning": True}
                 await asyncio.sleep(0.05)
+                final_facts = compiled_facts
+        else:
+            final_facts = compiled_facts
 
+        # 5. Save all finalized curated facts to the database
+        yield {"status": f"Saving {len(final_facts)} curated facts to SQLite database..."}
+        await asyncio.sleep(0.05)
+        
+        for fact_item in final_facts:
+            # We map document_id to the first document in the references list
+            doc_ids_list = fact_item.get("document_ids", [])
+            primary_doc_id = doc_ids_list[0] if doc_ids_list else None
+            # Fallback if primary_doc_id is not set
+            if not primary_doc_id and docs:
+                primary_doc_id = docs[0].id
+                doc_ids_list = [primary_doc_id]
+                
+            serialized_doc_ids = ",".join(str(did) for did in doc_ids_list)
+            
+            db_fact = models.Fact(
+                project_id=project_id,
+                document_id=primary_doc_id,
+                document_ids=serialized_doc_ids,
+                point=fact_item["point"],
+                context=fact_item["context"]
+            )
+            db.add(db_fact)
+            
+        await db.commit()
         yield {"status": "Knowledge base build complete", "done": True}
         await asyncio.sleep(0.05)
 
@@ -135,7 +319,8 @@ class PodcastFlow:
         await self.session_service.create_session(
             app_name=self.app_name,
             user_id=user_id,
-            session_id=session_id
+            session_id=session_id,
+            state={"speaker_1": "{speaker_1}", "speaker_2": "{speaker_2}"}
         )
         
         runner = await self._get_runner(self.generation_workflow)
@@ -147,8 +332,15 @@ class PodcastFlow:
         FACTS TO USE:
         {facts_str}
         
-        Generate a conversational script based on these facts, following the guiding prompt.
-        IMPORTANT: Use ONLY spoken words. NO stage directions, NO music cues, NO sound effects.
+        Generate a highly conversational and engaging script based on these facts, following the guiding prompt.
+        
+        IMPORTANT STYLE REQUIREMENTS:
+        1. SPEAKER NAMES: You must use the exact placeholders "{{speaker_1}}" and "{{speaker_2}}" (strictly lowercase with double curly braces in prompt, matching single curly braces in output text like {{speaker_1}}) for the speaker names. Do NOT use gendered or specific personal names.
+        2. CHATTY & NATURAL TONE: Make the script highly conversational, informal, and dynamic:
+           - The speakers MUST introduce themselves at the very beginning of the podcast (e.g. "Hi, I'm {{speaker_1}}!" and "And I'm {{speaker_2}}. Welcome back!").
+           - The speakers MUST actively and frequently feed off what each other says. Use conversational transition hooks such as "yes exactly, {{speaker_1}}!", "that's fascinating... another thing I've found surprising about that is...", "oh absolutely", "I see what you mean", etc.
+           - The dialogue should feel like a real, lively conversation, not two people alternately reading dry, isolated paragraphs. Use shorter sentences, rhetorical questions, light humor, and vocal agreement.
+        3. SPOKEN DIALOGUE ONLY: Use ONLY spoken words. NO stage directions, NO music cues, NO sound effects.
         """
         
         new_message = types.Content(
@@ -225,7 +417,8 @@ class PodcastFlow:
         await self.session_service.create_session(
             app_name=self.app_name,
             user_id=user_id,
-            session_id=session_id
+            session_id=session_id,
+            state={"speaker_1": "{speaker_1}", "speaker_2": "{speaker_2}"}
         )
         
         runner = await self._get_runner(self.generation_workflow)
@@ -235,8 +428,15 @@ class PodcastFlow:
         FACTS TO USE:
         {facts_str}
         
-        Generate a conversational script based on these facts.
-        IMPORTANT: Use ONLY spoken words. NO stage directions, NO music cues, NO sound effects.
+        Generate a highly conversational and engaging script based on these facts.
+        
+        IMPORTANT STYLE REQUIREMENTS:
+        1. SPEAKER NAMES: You must use the exact placeholders "{{speaker_1}}" and "{{speaker_2}}" (strictly lowercase with double curly braces in prompt, matching single curly braces in output text like {{speaker_1}}) for the speaker names. Do NOT use gendered or specific personal names.
+        2. CHATTY & NATURAL TONE: Make the script highly conversational, informal, and dynamic:
+           - The speakers MUST introduce themselves at the very beginning of the podcast (e.g. "Hi, I'm {{speaker_1}}!" and "And I'm {{speaker_2}}. Welcome back!").
+           - The speakers MUST actively and frequently feed off what each other says. Use conversational transition hooks such as "yes exactly, {{speaker_1}}!", "that's fascinating... another thing I've found surprising about that is...", "oh absolutely", "I see what you mean", etc.
+           - The dialogue should feel like a real, lively conversation, not two people alternately reading dry, isolated paragraphs. Use shorter sentences, rhetorical questions, light humor, and vocal agreement.
+        3. SPOKEN DIALOGUE ONLY: Use ONLY spoken words. NO stage directions, NO music cues, NO sound effects.
         """
         
         new_message = types.Content(

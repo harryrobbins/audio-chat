@@ -4,7 +4,7 @@
 
 <template>
   <header class="govuk-header" id="main-header">
-    <div class="max-w-5xl mx-auto flex items-center justify-between">
+    <div class="max-w-7xl mx-auto flex items-center justify-between">
       <div class="flex items-center gap-3">
         <!-- SVG Crown/Emblem of the UK Government -->
         <svg class="h-8 w-8 text-govuk-yellow fill-current" viewBox="0 0 100 100" aria-hidden="true" focusable="false">
@@ -29,7 +29,7 @@
   </header>
 
   <div class="border-b-4 border-govuk-yellow bg-govuk-white shadow-sm py-2 px-4 mb-6">
-    <div class="max-w-5xl mx-auto flex items-center justify-between text-sm text-govuk-grey-1 font-govuk">
+    <div class="max-w-7xl mx-auto flex items-center justify-between text-sm text-govuk-grey-1 font-govuk">
       <div class="flex items-center gap-2">
         <span class="font-bold">Kokoro-82M</span>
         <span class="bg-govuk-blue text-white text-[10px] px-1.5 py-0.5 font-bold uppercase rounded">Beta</span>
@@ -47,7 +47,7 @@
   </main>
 
   <footer class="bg-govuk-black border-t-8 border-govuk-blue text-govuk-grey-3 py-8 mt-12 text-sm">
-    <div class="max-w-5xl mx-auto px-4 flex flex-col md:flex-row justify-between items-center gap-4">
+    <div class="max-w-7xl mx-auto px-4 flex flex-col md:flex-row justify-between items-center gap-4">
       <div>
         <p class="font-bold text-govuk-white mb-1">Crown Copyright © 2026</p>
         <p>All content is available under the Open Government Licence v3.0, except where otherwise stated.</p>

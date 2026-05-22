@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from typing import List
 
 class Persona(BaseModel):
-    name: str = Field(..., description="Name of the persona")
+    name: str = Field(..., description="Name of the persona. Must be exactly '{speaker_1}' or '{speaker_2}'.")
     role: str = Field(..., description="Role in the podcast")
     description: str = Field(..., description="Personality description")
 
@@ -22,6 +22,7 @@ persona_generator = Agent(
     instruction="""
     You are a creative producer for a high-end podcast. 
     Based on the summary of facts provided in the conversation, create two distinct and engaging personas who will discuss this topic.
+    IMPORTANT: You must use the exact names "{{speaker_1}}" and "{{speaker_2}}" (strictly lowercase with curly braces) as placeholders for the two personas. Do NOT use gendered or specific personal names (like 'John' or 'Alice') to avoid mismatching with user-selected voice genders.
     """,
     output_schema=PodcastPersonas
 )

@@ -36,7 +36,13 @@ The main user flow is:
 ```text
 agents/
 ├── fact_extractor/
-│   ├── agent.py       # fact_extractor
+│   ├── agent.py       # fact_extractor (uses GEMINI_LITE_MODEL)
+│   └── README.md
+├── fact_reconciler/
+│   ├── agent.py       # fact_reconciler (uses GEMINI_MODEL)
+│   └── README.md
+├── fact_curator/
+│   ├── agent.py       # fact_curator (uses GEMINI_MODEL)
 │   └── README.md
 ├── persona_generator/
 │   ├── agent.py       # persona_generator
@@ -52,9 +58,19 @@ agents/
 
 ## Agent Roles
 ### Fact Extractor (`fact_extractor`)
-- Uses `google.adk.Agent` with a Pydantic `DocumentSummary` output schema.
+- Uses `google.adk.Agent` with a Pydantic `DocumentSummary` output schema and runs on `GEMINI_LITE_MODEL` (`gemini-3.1-flash-lite`).
 - Extracts a concise summary and `key_facts` from user-provided source text.
 - Each key fact contains a `point` and `context`.
+
+### Fact Reconciler (`fact_reconciler`)
+- Uses `google.adk.Agent` with a Pydantic `ReconciliationResponse` output schema and runs on `GEMINI_MODEL` (`gemini-flash-latest`).
+- Sequentially merges newly extracted facts into previously accumulated facts.
+- Decides whether to extend/update an existing fact (synthesizing points/contexts) or introduce it as a new fact.
+
+### Fact Curator (`fact_curator`)
+- Uses `google.adk.Agent` with a Pydantic `CurationResponse` output schema and runs on `GEMINI_MODEL` (`gemini-flash-latest`).
+- Performs a final global curation pass over the reconciled facts.
+- Deduplicates highly similar facts, groups overlapping concepts, synthesizes quotes, and ensures a clean, professional language tone.
 
 ### Persona Generator (`persona_generator`)
 - Uses a Pydantic `PodcastPersonas` output schema.
@@ -74,7 +90,12 @@ agents/
 `agents/podcast_flow.py` exposes a global `flow = PodcastFlow()` singleton so the ADK agents and in-memory session service are not repeatedly recreated.
 
 The project workflow is:
-- `build_knowledge_base(project_id, db)`: loads project documents, runs `fact_extractor` once per document, and stores extracted facts in SQLite.
+- `build_knowledge_base(project_id, db)`: Upgraded to a multi-phase compilation pipeline:
+  1. Clears existing project facts from SQLite to start compiling fresh.
+  2. Runs `fact_extractor` in **parallel** (via `asyncio.gather`) across all documents using `GEMINI_LITE_MODEL`.
+  3. Progressively integrates extraction results **sequentially** using the `fact_reconciler` agent, updating existing facts (accumulating reference citations) or appending new ones.
+  4. Performs a final **global curation pass** using `fact_curator` to deduplicate, unify, and polish the final facts.
+  5. Commits the final curated facts to SQLite with relational tracking in `document_id` and consolidated multi-source listing in `document_ids`.
 - `generate_script_stream(project_id, prompt, db, max_loops=3)`: loads stored facts, generates personas, runs an iterative writer/critic loop, stores the final script and personas, and streams status events.
 - `extract_facts(text)` and `generate_script(facts, max_loops=3)`: direct API helpers used by `routers/podcast.py` and the CLI script.
 
@@ -148,6 +169,16 @@ The following are local/generated artifacts and should not be committed:
 ## Notes for Future Agents
 - Prefer updating this `AGENTS.md` file for project-level agent guidance. `CLAUDE.md` and `GEMINI.md` are symlinks to it.
 - Keep documentation aligned with actual code; `IMPLEMENTATION_PLAN.md` may lag behind the implementation.
+- **Async Concurrency & Non-Blocking Design**:
+  - The Google ADK is executed asynchronously using its native `runner.run_async(...)` method and `async for` generators in `agents/podcast_flow.py`. Always use `run_async` rather than `run` in web server contexts.
+  - To prevent Server-Sent Events (SSE) buffering and immediately flush stream packets to the browser, cooperative yields (`await asyncio.sleep(0.05)`) are injected after SSE yields.
+  - Local neural-network speech synthesis (Kokoro-82M TTS) is a highly CPU-bound task. In `routers/audio.py`, it is offloaded to a background thread pool via `asyncio.to_thread` using a dedicated helper (`_synthesize_audio_thread`) to ensure the FastAPI event loop remains responsive.
+  - Keep SQLAlchemy database operations (`AsyncSession`) strictly on the main thread, as they are not thread-safe.
+  - **End-to-End Audio Synthesis Streaming Architecture**:
+    - **Background Thread Progress Queue:** The CPU-bound synthesis (`_synthesize_audio_thread_impl`) running inside the worker thread receives a thread-safe `queue.Queue`. As it processes and compiles each script dialogue line, it pushes state updates into the queue (`progress_queue.put({"type": "progress", "status": "..."})`). On completion, it inserts the database record and pushes the final metadata (`progress_queue.put({"type": "done", ...})`).
+    - **FastAPI SSE Generator:** The `POST /projects/scripts/{script_id}/generate-audio` endpoint yields a `StreamingResponse` (`text/event-stream`). An async event generator checks the thread-safe queue in a loop. To prevent blocking the async event loop, it polls the queue with non-blocking checks and injects cooperative yields (`await asyncio.sleep(0.05)`). This allows uvicorn to immediately flush each SSE data chunk (`data: {"status": "..."}\n\n`) to the client.
+    - **Frontend Stream Reader & Auto-Scroll Console:** The Vue frontend invokes `runStream()` using `fetch()` and a `ReadableStream` reader. Packets are parsed chunk-by-chunk using `TextDecoder` and split on double newlines (`\n\n`) to handle JSON events. In `ProjectDetail.vue`, streamed logs are appended to a reactive array `audioLogs`. A reactive watcher with `nextTick()` automatically sets the console's `scrollTop = scrollHeight` on updates, keeping the log terminal scrolled to the bottom.
 - The direct CLI script uses American Kokoro voices through `/generate`; the project audio endpoint uses British Kokoro voices through `routers/audio.py`.
 - The backend currently allows all CORS origins for local development.
 - The frontend has hard-coded `API_BASE = 'http://localhost:8000'` in its views.
+
